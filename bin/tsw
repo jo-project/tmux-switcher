@@ -1,24 +1,55 @@
 #!/usr/bin/env bash
 
+# determine if the tmux server is running
+if tmux list-sessions &>/dev/null; then
+	TMUX_RUNNING=0
+else
+	TMUX_RUNNING=1
+fi
+
+# determine the user's current position relative tmux:
+# serverless - there is no running tmux server
+# attached   - the user is currently attached to the running tmux server
+# detached   - the user is currently not attached to the running tmux server
+T_RUNTYPE="serverless"
+if [ "$TMUX_RUNNING" -eq 0 ]; then
+	if [ "$TMUX" ]; then # inside tmux
+		T_RUNTYPE="attached"
+	else # outside tmux
+		T_RUNTYPE="detached"
+	fi
+fi
+
+# display help text with an argument
 if [ "$1" = "-h" ] || [ "$1" == "--help" ]; then # help argument
 	printf "\n"
 	printf "\033[1m  tmux switcher - the smart tmux session manager\033[0m\n"
 	printf "\033[37m https://github.com/jo-project/tmux-switcher\n"
 	printf "\n"
 	printf "\033[32m  Run interactive mode\n"
-	printf "\033[34m      tsw\n"
+	printf "\033[34m      t\n"
 	printf "\033[34m        ctrl-s list only tmux sessions\n"
 	printf "\033[34m        ctrl-x list only zoxide results\n"
-	printf "\033[34m        ctrl-d list directories\n"
+	printf "\033[34m        ctrl-f list results from the find command\n"
 	printf "\n"
 	printf "\033[32m  Go to session (matches tmux session, zoxide result, or directory)\n"
 	printf "\033[34m      tsw {name}\n"
 	printf "\n"
 	printf "\033[32m  Open popup (while in tmux)\n"
-	printf "\033[34m      <prefix>+T\n"
-	printf "\033[34m        ctrl-s list only tmux sessions\n"
-	printf "\033[34m        ctrl-x list only zoxide results\n"
-	printf "\033[34m        ctrl-d list directories\n"
+
+	if [ "$TMUX_RUNNING" -eq 0 ]; then
+		T_BIND=$(tmux show-option -gvq "@tsw-bind")
+		if [ "$T_BIND" = "" ]; then
+			T_BIND="T"
+		fi
+		printf "\033[34m      <prefix>+%s\n" "$T_BIND"
+		printf "\033[34m        ctrl-s list only tmux sessions\n"
+		printf "\033[34m        ctrl-x list only zoxide results\n"
+		printf "\033[34m        ctrl-f list results from the find command\n"
+	else
+		printf "\033[34m      start tmux server to see bindings\n" "$T_BIND"
+	fi
+
 	printf "\n"
 	printf "\033[32m  Show help\n"
 	printf "\033[34m      tsw -h\n"
@@ -27,8 +58,12 @@ if [ "$1" = "-h" ] || [ "$1" == "--help" ]; then # help argument
 	exit 0
 fi
 
-tmux ls &>/dev/null
-TMUX_STATUS=$?
+HOME_REPLACER=""                                          # default to a noop
+echo "$HOME" | grep -E "^[a-zA-Z0-9\-_/.@]+$" &>/dev/null # chars safe to use in sed
+HOME_SED_SAFE=$?
+if [ $HOME_SED_SAFE -eq 0 ]; then # $HOME should be safe to use in sed
+	HOME_REPLACER="s|^$HOME/|~/|"
+fi
 
 get_fzf_prompt() {
 	local fzf_prompt
@@ -39,69 +74,54 @@ get_fzf_prompt() {
 	[ -n "$fzf_prompt" ] && echo "$fzf_prompt" || echo "$fzf_default_prompt"
 }
 
-HOME_REPLACER=""                                          # default to a noop
-echo "$HOME" | grep -E "^[a-zA-Z0-9\-_/.@]+$" &>/dev/null # chars safe to use in sed
-HOME_SED_SAFE=$?
-if [ $HOME_SED_SAFE -eq 0 ]; then # $HOME should be safe to use in sed
-	HOME_REPLACER="s|^$HOME/|~/|"
-fi
-
-BORDER_LABEL=" tmux switcher - joproject "
-HEADER=" ctrl-s: sessions / ctrl-x: zoxide / ctrl-d: directory"
 PROMPT=$(get_fzf_prompt)
-SESSION_BIND="ctrl-s:change-prompt( > )+change-border-label( tmux switcher - joproject [sessions] )+reload(tmux list-sessions -F '#S')"
-ZOXIDE_BIND="ctrl-x:change-prompt( > )+change-border-label( tmux switcher - joproject [zoxide] )+reload(zoxide query -l | sed -e \"$HOME_REPLACER\")"
 
-if fd --version &>/dev/null; then # fd is installed
-	DIR_BIND="ctrl-d:change-prompt( > )+change-border-label( tmux switcher - joproject [directory] )+reload(cd $HOME && echo $HOME; fd --type d --hidden --absolute-path --color never --exclude .git --exclude node_modules)"
-else # fd is not installed
-	DIR_BIND="ctrl-d:change-prompt( > )+change-border-label( tmux switcher - joproject [directory] )+reload(cd $HOME && find ~+ -type d -name node_modules -prune -o -name .git -prune -o -type d -print)"
-fi
+get_fzf_find_binding() {
+	local fzf_find_binding
+	local fzf_find_binding_default='ctrl-f:change-prompt(find> )+reload(find ~ -maxdepth 3 -type d)'
+	if [ "$TMUX_RUNNING" -eq 0 ]; then
+		fzf_find_binding="$(tmux show -gqv '@t-fzf-find-binding')"
+	fi
+	[ -n "$fzf_find_binding" ] && echo "$fzf_find_binding" || echo "$fzf_find_binding_default"
+}
+
+FIND_BIND=$(get_fzf_find_binding
 
 get_sessions_by_mru() {
 	tmux list-sessions -F '#{session_last_attached} #{session_name}' | sort --numeric-sort --reverse | awk '{print $2}'
 }
 
-if [ $# -eq 0 ]; then             # no argument provided
-	if [ "$TMUX" = "" ]; then        # not in tmux
-		if [ $TMUX_STATUS -eq 0 ]; then # tmux is running
-			RESULT=$(
-				(get_sessions_by_mru && (zoxide query -l | sed -e "$HOME_REPLACER")) | fzf \
-                    --color=bg+:-1,gutter:-1,bg:-1 \
-					--bind "$DIR_BIND" \
-					--bind "$SESSION_BIND" \
-					--bind "$ZOXIDE_BIND" \
-					--border-label "$BORDER_LABEL" \
-					--header "$HEADER" \
-					--no-sort \
-					--prompt "$PROMPT"
-			)
-		else # tmux is not running
-			RESULT=$(
-				(zoxide query -l | sed -e "$HOME_REPLACER") | fzf \
-                    --color=bg+:-1,gutter:-1,bg:-1 \
-					--bind "$DIR_BIND" \
-					--border-label "$BORDER_LABEL" \
-					--header " ctrl-d: directory" \
-					--no-sort \
-					--prompt "$PROMPT"
-			)
-		fi
-	else # in tmux
-		RESULT=$(
-			(get_sessions_by_mru && (zoxide query -l | sed -e "$HOME_REPLACER")) | fzf-tmux \
-                --color=bg+:-1,gutter:-1,bg:-1 \
-				--bind "$DIR_BIND" \
-				--bind "$SESSION_BIND" \
-				--bind "$ZOXIDE_BIND" \
-				--border-label "$BORDER_LABEL" \
-				--header "$HEADER" \
-				--no-sort \
-				--prompt "$PROMPT" \
-				-p 60%,50%
-		)
+get_zoxide_results() {
+	zoxide query -l | sed -e "$HOME_REPLACER"
+}
+
+get_fzf_results() {
+	if [ "$TMUX_RUNNING" -eq 0 ]; then
+		fzf_default_results="$(tmux show -gqv '@tsw-fzf-default-results')"
+		case $fzf_default_results in
+		sessions)
+			get_sessions_by_mru
+			;;
+		zoxide)
+			get_zoxide_results
+			;;
+		*)
+			get_sessions_by_mru && get_zoxide_results # default shows both
+			;;
+		esac
+	else
+		get_zoxide_results # only show zoxide results when outside tmux
 	fi
-else # argument provided
+}
+
+fzf_border_label_default=' tsw - smart tmux session manager '
+BORDER_LABEL=${T_FZF_BORDER_LABEL:-$fzf_border_label_default}
+HEADER=" ^s sessions ^x zoxide ^f find"
+SESSION_BIND="ctrl-s:change-prompt(sessions> )+reload(tmux list-sessions -F '#S')"
+ZOXIDE_BIND="ctrl-x:change-prompt(zoxide> )+reload(zoxide query -l | sed -e \"$HOME_REPLACER\")"
+TAB_BIND="tab:down,btab:up"
+
+if [ $# -eq 1 ]; then # argument provided
 	zoxide query "$1" &>/dev/null
 	ZOXIDE_RESULT_EXIT_CODE=$?
 	if [ $ZOXIDE_RESULT_EXIT_CODE -eq 0 ]; then # zoxide result found
@@ -116,6 +136,57 @@ else # argument provided
 			exit 1
 		fi
 	fi
+else # argument not provided
+	case $T_RUNTYPE in
+	attached)
+		if [[ ! -v $FZF_TMUX_OPTS ]]; then
+			FZF_TMUX_OPTS="-p 53%,58%"
+		fi
+
+		RESULT=$(
+			(get_fzf_results) | fzf-tmux \
+				--color=bg+:-1,gutter:-1,bg:-1 \
+				--bind "$FIND_BIND" \
+				--bind "$SESSION_BIND" \
+				--bind "$TAB_BIND" \
+				--bind "$ZOXIDE_BIND" \
+				--border-label "$BORDER_LABEL" \
+				--header "$HEADER" \
+				--no-sort \
+				--prompt "$PROMPT" \
+				$FZF_TMUX_OPTS
+		)
+		;;
+	detached)
+		RESULT=$(
+			(get_fzf_results) | fzf \
+				--color=bg+:-1,gutter:-1,bg:-1 \
+				--bind "$FIND_BIND" \
+				--bind "$SESSION_BIND" \
+				--bind "$TAB_BIND" \
+				--bind "$ZOXIDE_BIND" \
+				--border \
+				--border-label "$BORDER_LABEL" \
+				--header "$HEADER" \
+				--no-sort \
+				--prompt "$PROMPT"
+		)
+		;;
+	serverless)
+		RESULT=$(
+			(get_fzf_results) | fzf \
+				--color=bg+:-1,gutter:-1,bg:-1 \
+				--bind "$FIND_BIND" \
+				--bind "$TAB_BIND" \
+				--bind "$ZOXIDE_BIND" \
+				--border \
+				--border-label "$BORDER_LABEL" \
+				--header " ^x zoxide ^f find" \
+				--no-sort \
+				--prompt "$PROMPT"
+		)
+		;;
+	esac
 fi
 
 if [ "$RESULT" = "" ]; then # no result
@@ -127,26 +198,41 @@ if [ $HOME_SED_SAFE -eq 0 ]; then
 fi
 
 zoxide add "$RESULT" &>/dev/null # add to zoxide database
-FOLDER=$(basename "$RESULT")
-SESSION_NAME=$(echo "$FOLDER" | tr ' .:' '_')
 
-if [ $TMUX_STATUS -eq 0 ]; then                                 # tmux is running
-	SESSION=$(tmux list-sessions -F '#S' | grep "^$SESSION_NAME$") # find existing session
+if [[ $RESULT != /* ]]; then # not folder path from zoxide result
+	SESSION_NAME=$RESULT
+elif [[ $T_SESSION_USE_GIT_ROOT == 'true' ]]; then
+	GIT_ROOT=$(git -C $RESULT rev-parse --show-toplevel 2>/dev/null) && echo $GIT_ROOT >/dev/null
+	if [[ $? -ne 0 ]]; then # not inside git repository
+		SESSION_NAME=$(basename "$RESULT" | tr ' .:' '_')
+	else # is in git repository
+		BASENAME=$(basename $GIT_ROOT)
+		RELATIVE_PATH=${RESULT#$GIT_ROOT}
+		SEPARATOR="/"
+		FORMATTED_PATH="${RELATIVE_PATH//\//$SEPARATOR}"
+		SESSION_NAME=$(echo $BASENAME$FORMATTED_PATH | tr ' .:' '_')
+	fi
+elif [[ $T_SESSION_NAME_INCLUDE_PARENT == 'true' ]]; then
+	SESSION_NAME=$(echo "$RESULT" | tr ' .:' '_' | awk -F "/" '{print $(NF-1)"/"$NF}')
 else
-	SESSION=""
+	SESSION_NAME=$(basename "$RESULT" | tr ' .:' '_')
 fi
 
-if [ "$TMUX" = "" ]; then                          # not currently in tmux
-	if [ "$SESSION" = "" ]; then                      # session does not exist
-		tmux new-session -s "$SESSION_NAME" -c "$RESULT" # create session and attach
-	else                                              # session exists
-		tmux attach -t "$SESSION"                        # attach to session
-	fi
-else                                                  # currently in tmux
-	if [ "$SESSION" = "" ]; then                         # session does not exist
-		tmux new-session -d -s "$SESSION_NAME" -c "$RESULT" # create session
-		tmux switch-client -t "$SESSION_NAME"               # attach to session
-	else                                                 # session exists
-		tmux switch-client -t "$SESSION"                    # switch to session
-	fi
+if [ "$T_RUNTYPE" != "serverless" ]; then
+	SESSION=$(tmux list-sessions -F '#S' | grep "^$SESSION_NAME$") # find existing session
 fi
+
+if [ "$SESSION" = "" ]; then # session is missing
+	SESSION="$SESSION_NAME"
+	tmux new-session -d -s "$SESSION" -c "$RESULT" # create session
+fi
+
+case $T_RUNTYPE in # attach to session
+attached)
+	tmux switch-client -t "$SESSION"
+	;;
+detached) ;&
+serverless)
+	tmux attach -t "$SESSION"
+	;;
+esac
